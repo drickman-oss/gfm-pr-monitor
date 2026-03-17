@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+GoFundMe PR Placement Monitor
+Searches Google News for UK media coverage of pitched fundraisers.
+Sends a weekly/monthly email digest to the comms team.
+
+Usage:
+  python3 ~/pr_placement_monitor.py                        # search last month's unplaced pitches
+  python3 ~/pr_placement_monitor.py --month 2026-02        # specific month
+  python3 ~/pr_placement_monitor.py --validate             # test against known placements
+  python3 ~/pr_placement_monitor.py --preview              # generate HTML only, no email
+  python3 ~/pr_placement_monitor.py --limit 100            # override search limit
+
+Needs in ~/.env:
+  GMAIL_USER=dina.rickman@gmail.com
+  GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
+"""
+
+import os
+import csv
+import re
+import json
+import time
+import smtplib
+import requests
+import argparse
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from html.parser import HTMLParser
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
+
+load_dotenv(os.path.expanduser('~/.env'))
+
+NEWSAPI_KEY        = os.getenv('NEWSAPI_KEY')
+GMAIL_USER         = os.getenv('GMAIL_USER')
+GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
+
+DEFAULT_PITCH_CSV  = os.path.expanduser('~/Downloads/gofundme_v2 pitchtool_v2 2026-03-16T1248.csv')
+CACHE_FILE         = os.path.expanduser('~/pr_placement_cache.json')
+
+# Default: top 50 per run stays within free tier (100/day leaves headroom)
+DEFAULT_LIMIT = 50
+
+# UK outlet keywords — used to filter / flag results
+UK_SIGNALS = [
+    'BBC', 'Guardian', 'Daily Mail', 'Mirror', 'Telegraph', 'Independent',
+    'Sun', 'The Times', 'Sky', 'Metro', 'Evening Standard', 'Express',
+    'Chronicle', 'Herald', 'Gazette', 'Echo', 'Post', '.co.uk', 'Manchester',
+    'Liverpool', 'Leeds', 'Birmingham', 'Glasgow', 'Edinburgh', 'Bristol',
+    'Wales', 'Scotland', 'Yorkshire', 'Lancashire', 'Essex', 'Kent'
+]
+
+# ─────────────────────────────────────────────
+# DATA LOADING
+# ─────────────────────────────────────────────
+
+class HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+    def handle_data(self, data):
+        self.text.append(data)
+    def get_text(self):
+        return ' '.join(self.text)
+
+def strip_html(html):
+    if not html:
+        return ''
+    s = HTMLStripper()
+    try:
+        s.feed(html)
+    except Exception:
+        pass
+    return re.sub(r'\s+', ' ', s.get_text()).strip()
+
+def parse_num(val):
+    try:
+        return int(str(val).replace(',', '').strip() or 0)
+    except Exception:
+        return 0
+
+def load_pitches(csv_path, month_filter=None):
+    pitches = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            month = (row.get('Pitch Month') or '').strip()
+            if not month or month == 'Pitch Month':
+                continue
+            if month_filter and month != month_filter:
+                continue
+            link = (row.get('Fundraiser Link') or '').strip()
+            pitches.append({
+                'id':               link,
+                'name':             f"{row.get('First Name','').strip()} {row.get('Last Name','').strip()}",
+                'first_name':       row.get('First Name', '').strip(),
+                'last_name':        row.get('Last Name', '').strip(),
+                'fundraiser_name':  (row.get('Fundraiser Name') or '').strip(),
+                'fundraiser_link':  link,
+                'description':      strip_html(row.get('Fundraiser Description', '')),
+                'pitch_month':      month,
+                'total_pitches':    parse_num(row.get('Total Pitches', 0)),
+                'total_placements': parse_num(row.get('Total Placements', 0)),
+            })
+    return pitches
+
+# ─────────────────────────────────────────────
+# CACHE
+# ─────────────────────────────────────────────
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_cache(cache):
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(cache, f, indent=2)
+
+# ─────────────────────────────────────────────
+# SEARCH
+# ─────────────────────────────────────────────
+
+def build_query(pitch):
+    """
+    Search by fundraiser name — this is the story title the journalist
+    would reference, not the pitcher's name (which is a GFM comms employee).
+    e.g. "Zachary Rupert Ince" or "Elderly Couple ruined by Cowboy Builders"
+    Strip common GoFundMe boilerplate phrases that add noise.
+    """
+    name = pitch['fundraiser_name'].strip()
+    # Remove common GFM boilerplate from fundraiser names
+    for phrase in ['GoFundMe', 'Help Us', 'Help Me', 'Support for', 'In Loving Memory',
+                   'Fundraiser for', 'Raising money for']:
+        name = re.sub(re.escape(phrase), '', name, flags=re.IGNORECASE).strip(' :-')
+    name = name.strip(' :-').strip()
+    if not name:
+        name = pitch['fundraiser_name']
+    # No quotes — broader match finds more coverage where articles paraphrase the title
+    return f'{name} GoFundMe'
+
+def is_likely_uk(article):
+    source_name = (article.get('source') or {}).get('name', '') or ''
+    url = article.get('url', '') or ''
+    text = source_name + ' ' + url
+    return any(sig.lower() in text.lower() for sig in UK_SIGNALS)
+
+def search_google_news(query):
+    """
+    Search Google News RSS (UK edition) for coverage of a fundraiser.
+    No API key. No rate limit. Full UK regional press coverage.
+    Returns articles in the same format as the old NewsAPI results.
+    """
+    q = urllib.parse.quote(query)
+    url = f'https://news.google.com/rss/search?q={q}&hl=en-GB&gl=GB&ceid=GB:en'
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; GFMPRBot/1.0)'}, timeout=15)
+        if r.status_code != 200:
+            print(f"  ⚠ Google News returned {r.status_code}")
+            return []
+        root = ET.fromstring(r.content)
+        articles = []
+        for item in root.findall('.//item')[:5]:
+            title_raw = item.findtext('title', '')
+            link      = item.findtext('link', '')
+            pub_date  = item.findtext('pubDate', '')
+            # Google News appends " - Source Name" to titles
+            if ' - ' in title_raw:
+                parts        = title_raw.rsplit(' - ', 1)
+                title_clean  = parts[0].strip()
+                source_name  = parts[1].strip()
+            else:
+                title_clean  = title_raw
+                source_name  = ''
+            articles.append({
+                'title':       title_clean,
+                'url':         link,
+                'source':      {'name': source_name},
+                'publishedAt': pub_date,
+                'description': '',
+            })
+        return articles
+    except Exception as e:
+        print(f"  ⚠ Google News error: {e}")
+        return []
+
+# ─────────────────────────────────────────────
+# EMAIL
+# ─────────────────────────────────────────────
+
+def format_email(results, month, validate_mode=False):
+    found     = [r for r in results if r['articles']]
+    not_found = [r for r in results if not r['articles']]
+    now_str   = datetime.now().strftime('%-d %B %Y')
+
+    header_note = (
+        f"VALIDATE MODE — testing against {len(results)} known placements · {now_str}"
+        if validate_mode else
+        f"{month} pitches · run {now_str} · top {len(results)} by pitch count"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:680px;margin:0 auto;padding:20px;color:#111">
+
+<div style="background:#00B964;padding:16px 24px;border-radius:10px;margin-bottom:24px">
+  <h1 style="color:#fff;margin:0;font-size:18px;font-weight:800">GoFundMe PR Placement Digest</h1>
+  <p style="color:rgba(255,255,255,.85);margin:6px 0 0;font-size:12px">
+    {header_note}<br>
+    <strong style="color:#fff">{len(found)} potential placements</strong> found &nbsp;·&nbsp;
+    {len(not_found)} not found
+  </p>
+</div>
+"""
+
+    # ── FOUND ──
+    if found:
+        html += f'<h2 style="font-size:15px;margin-bottom:14px">✅ Potential placements — please confirm in CMS ({len(found)})</h2>'
+        for r in found:
+            html += f"""
+<div style="border:1.5px solid #D1FAE5;border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#F0FBF6">
+  <div style="font-weight:700;font-size:14px">{r['name']}</div>
+  <div style="font-size:11px;color:#6B7280;margin-bottom:10px">
+    {r['fundraiser_name'][:70]}
+    &nbsp;·&nbsp;<a href="{r['fundraiser_link']}" style="color:#00B964">{r['fundraiser_link'][:50]}</a>
+  </div>"""
+            for a in r['articles']:
+                pub_date    = (a.get('publishedAt') or '')[:10]
+                source_name = (a.get('source') or {}).get('name', 'Unknown')
+                title       = a.get('title', '(no title)')
+                url         = a.get('url', '#')
+                desc        = ((a.get('description') or '')[:130] + '…') if a.get('description') else ''
+                uk_badge    = '🇬🇧 ' if is_likely_uk(a) else ''
+                html += f"""
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+    <div style="font-size:10px;color:#00B964;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px">
+      {uk_badge}{source_name} &nbsp;·&nbsp; {pub_date}
+    </div>
+    <a href="{url}" style="color:#111;font-weight:600;font-size:12px;text-decoration:none;line-height:1.4">{title}</a>
+    <p style="font-size:11px;color:#6B7280;margin:4px 0 0;line-height:1.5">{desc}</p>
+  </div>"""
+            html += '</div>'
+
+    # ── NOT FOUND ──
+    if not_found:
+        html += f'<h2 style="font-size:15px;margin:22px 0 10px">⭕ No coverage found ({len(not_found)})</h2>'
+        html += '<div style="background:#F9FAFB;border:1px solid #E5E7EB;border-radius:10px;overflow:hidden">'
+        for r in not_found:
+            html += f"""
+<div style="padding:8px 14px;border-bottom:1px solid #F3F4F6;font-size:12px">
+  <span style="font-weight:600">{r['name']}</span>
+  <span style="color:#9CA3AF;float:right">{r['fundraiser_name'][:50]}</span>
+</div>"""
+        html += '</div>'
+
+    html += f"""
+<p style="font-size:11px;color:#9CA3AF;margin-top:22px;padding-top:12px;border-top:1px solid #E5E7EB;line-height:1.6">
+  Searched via NewsAPI · UK sources prioritised · {len(results)} fundraisers checked<br>
+  Found a missed placement? Reply to this email with the URL and we'll add it.
+</p>
+</body></html>"""
+    return html
+
+def send_email(html_body, recipients, month):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f"PR Placement Digest — {month} · {datetime.now().strftime('%-d %b %Y')}"
+    msg['From']    = GMAIL_USER
+    msg['To']      = ', '.join(recipients)
+    msg.attach(MIMEText(html_body, 'html'))
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, recipients, msg.as_string())
+    print(f"✓ Email sent to {recipients}")
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description='GoFundMe PR Placement Monitor')
+    parser.add_argument('--csv',        default=DEFAULT_PITCH_CSV, help='Path to pitch CSV')
+    parser.add_argument('--month',      default=None,              help='Pitch month e.g. 2026-02 (default: last month)')
+    parser.add_argument('--limit',      type=int, default=DEFAULT_LIMIT, help='Max searches per run (default 50)')
+    parser.add_argument('--recipients', nargs='+', default=['drickman@gofundme.com'], help='Email recipients')
+    parser.add_argument('--preview',    action='store_true', help='Save HTML preview only — no email sent')
+    parser.add_argument('--validate',   action='store_true', help='Test against already-placed fundraisers to measure accuracy')
+    parser.add_argument('--no-cache',   action='store_true', help='Ignore cache and re-search everything')
+    args = parser.parse_args()
+
+    # Default month = last calendar month
+    if not args.month:
+        first_of_this_month = datetime.now().replace(day=1)
+        last_month = first_of_this_month - timedelta(days=1)
+        args.month = last_month.strftime('%Y-%m')
+
+    print(f"\n{'='*50}")
+    print(f"PR Placement Monitor — {args.month}")
+    print(f"{'='*50}")
+
+    print(f"Loading pitches...")
+    all_pitches = load_pitches(args.csv, month_filter=args.month)
+    print(f"Found {len(all_pitches)} pitches for {args.month}")
+
+    if args.validate:
+        # Test mode: only search pitches already confirmed as placed
+        targets = [p for p in all_pitches if p['total_placements'] > 0]
+        print(f"VALIDATE MODE: testing against {len(targets)} known placements")
+    else:
+        # Normal mode: search unplaced, highest pitch count first (most pitched = priority stories)
+        targets = [p for p in all_pitches if p['total_placements'] == 0]
+        targets.sort(key=lambda x: x['total_pitches'], reverse=True)
+        print(f"{len(targets)} unplaced pitches — searching top {args.limit} by pitch count")
+
+    targets = targets[:args.limit]
+
+    cache = {} if args.no_cache else load_cache()
+    results = []
+    api_calls = 0
+
+    for i, pitch in enumerate(targets):
+        cache_key = pitch['id'] or pitch['name']
+
+        if cache_key in cache:
+            print(f"[{i+1}/{len(targets)}] Cache hit: {pitch['name']}")
+            results.append({**pitch, 'articles': cache[cache_key]})
+            continue
+
+        query = build_query(pitch)
+
+        print(f"[{i+1}/{len(targets)}] Searching: {query}")
+        articles = search_google_news(query)
+
+        results.append({**pitch, 'articles': articles, 'skipped': False})
+        cache[cache_key] = articles
+        api_calls += 1
+
+        time.sleep(0.5)  # gentle rate limiting
+
+    save_cache(cache)
+    print(f"\nDone. {api_calls} API calls made. Cache updated.")
+
+    # ── Validate report ──
+    if args.validate:
+        found_count = sum(1 for r in results if r['articles'])
+        pct = int(100 * found_count / len(results)) if results else 0
+        print(f"\n=== VALIDATION RESULTS ===")
+        print(f"Known placements tested : {len(results)}")
+        print(f"Found by search         : {found_count} ({pct}%)")
+        print(f"Missed                  : {len(results) - found_count} ({100-pct}%)")
+        missed = [r for r in results if not r['articles']]
+        if missed:
+            print("\nMissed placements (check these manually to understand why):")
+            for r in missed[:10]:
+                print(f"  - {r['name']} | {r['fundraiser_link']}")
+
+    # ── Email ──
+    html = format_email(results, args.month, validate_mode=args.validate)
+
+    preview_path = os.path.expanduser('~/Downloads/pr_placement_digest_preview.html')
+    with open(preview_path, 'w') as f:
+        f.write(html)
+    print(f"✓ Preview saved: {preview_path}")
+
+    if args.preview or args.validate:
+        print("(Preview mode — no email sent)")
+    else:
+        send_email(html, args.recipients, args.month)
+
+
+if __name__ == '__main__':
+    main()

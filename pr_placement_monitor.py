@@ -31,6 +31,7 @@ from html.parser import HTMLParser
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
+import csv as csvlib
 
 load_dotenv(os.path.expanduser('~/.env'))
 
@@ -356,13 +357,37 @@ def main():
             for r in missed[:10]:
                 print(f"  - {r['name']} | {r['fundraiser_link']}")
 
-    # ── Email ──
-    html = format_email(results, args.month, validate_mode=args.validate)
+    # ── CSV output ──
+    csv_path = os.path.expanduser(f'~/Downloads/pr_placements_{args.month}.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csvlib.writer(f)
+        writer.writerow(['Pitcher Name', 'Fundraiser Name', 'GoFundMe URL',
+                         'Source', 'Headline', 'Article URL', 'Date', 'Confirmed?'])
+        for r in results:
+            if r['articles']:
+                for a in r['articles']:
+                    source   = (a.get('source') or {}).get('name', '')
+                    headline = a.get('title', '')
+                    art_url  = a.get('url', '')
+                    pub_date = (a.get('publishedAt') or '')[:16]
+                    writer.writerow([
+                        r['name'], r['fundraiser_name'], r['fundraiser_link'],
+                        source, headline, art_url, pub_date, ''
+                    ])
+            else:
+                # One row per unfound pitch so comms has the full list
+                writer.writerow([
+                    r['name'], r['fundraiser_name'], r['fundraiser_link'],
+                    'NOT FOUND', '', '', '', ''
+                ])
+    print(f"✓ CSV saved:     {csv_path}")
 
+    # ── HTML email ──
+    html = format_email(results, args.month, validate_mode=args.validate)
     preview_path = os.path.expanduser('~/Downloads/pr_placement_digest_preview.html')
     with open(preview_path, 'w') as f:
         f.write(html)
-    print(f"✓ Preview saved: {preview_path}")
+    print(f"✓ HTML preview:  {preview_path}")
 
     if args.preview or args.validate:
         print("(Preview mode — no email sent)")

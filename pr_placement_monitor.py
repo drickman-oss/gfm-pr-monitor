@@ -83,7 +83,11 @@ def parse_num(val):
     except Exception:
         return 0
 
-def load_pitches(csv_path, month_filter=None):
+def load_pitches(csv_path, month_filter=None, pitcher_filter=None):
+    """
+    pitcher_filter: list of partial pitcher name strings (case-insensitive).
+    e.g. ['asa bennett', 'adela'] will match any pitcher whose name contains either string.
+    """
     pitches = []
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -93,6 +97,10 @@ def load_pitches(csv_path, month_filter=None):
                 continue
             if month_filter and month != month_filter:
                 continue
+            if pitcher_filter:
+                full_name = f"{row.get('First Name','').strip()} {row.get('Last Name','').strip()}".lower()
+                if not any(p.lower() in full_name for p in pitcher_filter):
+                    continue
             link = (row.get('Fundraiser Link') or '').strip()
             pitches.append({
                 'id':               link,
@@ -165,7 +173,7 @@ def headline_confidence(fundraiser_name, headline):
     headline_lower = headline.lower()
     matches = sum(1 for w in words if w in headline_lower)
     score = matches / len(words)
-    return 'High' if score >= 0.3 else 'Low'
+    return 'High' if score >= 0.5 else 'Low'
 
 def is_likely_uk(article):
     source_name = (article.get('source') or {}).get('name', '') or ''
@@ -330,6 +338,7 @@ def main():
     parser.add_argument('--validate',   action='store_true', help='Test against already-placed fundraisers to measure accuracy')
     parser.add_argument('--no-cache',   action='store_true', help='Ignore cache and re-search everything')
     parser.add_argument('--rate',       type=int, default=40, help='Requests per hour (default 40, increase with caution)')
+    parser.add_argument('--pitcher',    nargs='+', default=None, help='Filter by pitcher name(s), e.g. --pitcher "asa bennett" adela')
     args = parser.parse_args()
 
     # Default month = last calendar month
@@ -343,7 +352,7 @@ def main():
     print(f"{'='*50}")
 
     print(f"Loading pitches...")
-    all_pitches = load_pitches(args.csv, month_filter=args.month)
+    all_pitches = load_pitches(args.csv, month_filter=args.month, pitcher_filter=args.pitcher)
     print(f"Found {len(all_pitches)} pitches for {args.month}")
 
     if args.validate:
@@ -379,6 +388,13 @@ def main():
 
         print(f"[{i+1}/{len(targets)}] Searching: {query}")
         articles = search_google_news(query)
+
+        # Filter to high-confidence matches only — removes false positives like
+        # generic GoFundMe articles that don't mention the actual fundraiser
+        articles = [
+            a for a in articles
+            if headline_confidence(pitch['fundraiser_name'], a.get('title', '')) == 'High'
+        ]
 
         results.append({**pitch, 'articles': articles, 'skipped': False})
         cache[cache_key] = articles

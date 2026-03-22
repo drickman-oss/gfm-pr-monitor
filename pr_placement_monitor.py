@@ -144,11 +144,41 @@ def build_query(pitch):
     # No quotes — broader match finds more coverage where articles paraphrase the title
     return f'{name} GoFundMe'
 
+STOPWORDS = {
+    'the','a','an','and','or','for','to','in','of','on','at','is','are','was',
+    'were','help','support','fund','gofundme','our','his','her','their','my',
+    'after','with','from','into','during','through','about','by','as','up',
+}
+
+def headline_confidence(fundraiser_name, headline):
+    """
+    Returns 'High' if enough significant words from the fundraiser name
+    appear in the article headline, 'Low' otherwise.
+    Low-confidence matches are likely false positives (wrong story matched).
+    """
+    words = [
+        w.lower() for w in re.findall(r'\w+', fundraiser_name)
+        if w.lower() not in STOPWORDS and len(w) > 3
+    ]
+    if not words:
+        return 'Low'
+    headline_lower = headline.lower()
+    matches = sum(1 for w in words if w in headline_lower)
+    score = matches / len(words)
+    return 'High' if score >= 0.3 else 'Low'
+
 def is_likely_uk(article):
     source_name = (article.get('source') or {}).get('name', '') or ''
     url = article.get('url', '') or ''
     text = source_name + ' ' + url
     return any(sig.lower() in text.lower() for sig in UK_SIGNALS)
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+]
+_ua_index = 0
 
 def search_google_news(query):
     """
@@ -156,38 +186,48 @@ def search_google_news(query):
     No API key. No rate limit. Full UK regional press coverage.
     Returns articles in the same format as the old NewsAPI results.
     """
+    global _ua_index
     q = urllib.parse.quote(query)
     url = f'https://news.google.com/rss/search?q={q}&hl=en-GB&gl=GB&ceid=GB:en'
-    try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; GFMPRBot/1.0)'}, timeout=15)
-        if r.status_code != 200:
-            print(f"  ⚠ Google News returned {r.status_code}")
+    for attempt in range(3):
+        try:
+            ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
+            _ua_index += 1
+            r = requests.get(url, headers={'User-Agent': ua}, timeout=15)
+            if r.status_code == 503:
+                wait = 10 * (attempt + 1)
+                print(f"  ⚠ 503 — waiting {wait}s before retry {attempt+1}/3")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                print(f"  ⚠ Google News returned {r.status_code}")
+                return []
+            root = ET.fromstring(r.content)
+            articles = []
+            for item in root.findall('.//item')[:5]:
+                title_raw = item.findtext('title', '')
+                link      = item.findtext('link', '')
+                pub_date  = item.findtext('pubDate', '')
+                # Google News appends " - Source Name" to titles
+                if ' - ' in title_raw:
+                    parts        = title_raw.rsplit(' - ', 1)
+                    title_clean  = parts[0].strip()
+                    source_name  = parts[1].strip()
+                else:
+                    title_clean  = title_raw
+                    source_name  = ''
+                articles.append({
+                    'title':       title_clean,
+                    'url':         link,
+                    'source':      {'name': source_name},
+                    'publishedAt': pub_date,
+                    'description': '',
+                })
+            return articles
+        except Exception as e:
+            print(f"  ⚠ Google News error: {e}")
             return []
-        root = ET.fromstring(r.content)
-        articles = []
-        for item in root.findall('.//item')[:5]:
-            title_raw = item.findtext('title', '')
-            link      = item.findtext('link', '')
-            pub_date  = item.findtext('pubDate', '')
-            # Google News appends " - Source Name" to titles
-            if ' - ' in title_raw:
-                parts        = title_raw.rsplit(' - ', 1)
-                title_clean  = parts[0].strip()
-                source_name  = parts[1].strip()
-            else:
-                title_clean  = title_raw
-                source_name  = ''
-            articles.append({
-                'title':       title_clean,
-                'url':         link,
-                'source':      {'name': source_name},
-                'publishedAt': pub_date,
-                'description': '',
-            })
-        return articles
-    except Exception as e:
-        print(f"  ⚠ Google News error: {e}")
-        return []
+    return []
 
 # ─────────────────────────────────────────────
 # EMAIL
@@ -289,6 +329,7 @@ def main():
     parser.add_argument('--preview',    action='store_true', help='Save HTML preview only — no email sent')
     parser.add_argument('--validate',   action='store_true', help='Test against already-placed fundraisers to measure accuracy')
     parser.add_argument('--no-cache',   action='store_true', help='Ignore cache and re-search everything')
+    parser.add_argument('--rate',       type=int, default=40, help='Requests per hour (default 40, increase with caution)')
     args = parser.parse_args()
 
     # Default month = last calendar month
@@ -317,6 +358,11 @@ def main():
 
     targets = targets[:args.limit]
 
+    sleep_secs = 3600 / args.rate
+    uncached   = sum(1 for p in targets if (p['id'] or p['name']) not in ({} if args.no_cache else load_cache()))
+    eta_mins   = round(uncached * sleep_secs / 60)
+    print(f"Rate: {args.rate}/hr ({sleep_secs:.0f}s between requests) · ~{eta_mins} min ETA for {uncached} uncached pitches")
+
     cache = {} if args.no_cache else load_cache()
     results = []
     api_calls = 0
@@ -338,10 +384,13 @@ def main():
         cache[cache_key] = articles
         api_calls += 1
 
-        time.sleep(0.5)  # gentle rate limiting
+        # Save cache after every request so progress is preserved if interrupted
+        save_cache(cache)
 
-    save_cache(cache)
-    print(f"\nDone. {api_calls} API calls made. Cache updated.")
+        if i < len(targets) - 1:
+            time.sleep(sleep_secs)
+
+    print(f"\nDone. {api_calls} API calls made. Cache saved.")
 
     # ── Validate report ──
     if args.validate:
@@ -357,29 +406,36 @@ def main():
             for r in missed[:10]:
                 print(f"  - {r['name']} | {r['fundraiser_link']}")
 
-    # ── CSV output ──
+    # ── CSV output (horizontal — one row per fundraiser) ──
+    max_articles = max((len(r['articles']) for r in results), default=0)
     csv_path = os.path.expanduser(f'~/Downloads/pr_placements_{args.month}.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csvlib.writer(f)
-        writer.writerow(['Pitcher Name', 'Fundraiser Name', 'GoFundMe URL',
-                         'Source', 'Headline', 'Article URL', 'Date', 'Confirmed?'])
+        # Header: fixed columns then placement groups
+        header = ['Pitcher Name', 'Fundraiser Name', 'GoFundMe URL', 'Found?', 'Confidence']
+        for n in range(1, max_articles + 1):
+            header += [f'Source {n}', f'Headline {n}', f'URL {n}', f'Date {n}']
+        writer.writerow(header)
         for r in results:
             if r['articles']:
-                for a in r['articles']:
-                    source   = (a.get('source') or {}).get('name', '')
-                    headline = a.get('title', '')
-                    art_url  = a.get('url', '')
-                    pub_date = (a.get('publishedAt') or '')[:16]
-                    writer.writerow([
-                        r['name'], r['fundraiser_name'], r['fundraiser_link'],
-                        source, headline, art_url, pub_date, ''
-                    ])
+                # Overall confidence = High only if at least one article scores High
+                confidences = [
+                    headline_confidence(r['fundraiser_name'], a.get('title', ''))
+                    for a in r['articles']
+                ]
+                overall = 'High' if 'High' in confidences else 'Low'
             else:
-                # One row per unfound pitch so comms has the full list
-                writer.writerow([
-                    r['name'], r['fundraiser_name'], r['fundraiser_link'],
-                    'NOT FOUND', '', '', '', ''
-                ])
+                overall = ''
+            row = [r['name'], r['fundraiser_name'], r['fundraiser_link'],
+                   'YES' if r['articles'] else 'NO', overall]
+            for a in r['articles']:
+                row += [
+                    (a.get('source') or {}).get('name', ''),
+                    a.get('title', ''),
+                    a.get('url', ''),
+                    (a.get('publishedAt') or '')[:16],
+                ]
+            writer.writerow(row)
     print(f"✓ CSV saved:     {csv_path}")
 
     # ── HTML email ──

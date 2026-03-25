@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate
 from dotenv import load_dotenv
 import csv as csvlib
 
@@ -134,23 +135,28 @@ def save_cache(cache):
 # SEARCH
 # ─────────────────────────────────────────────
 
-def build_query(pitch):
+def extract_slug(fundraiser_link):
+    """Extract the slug from a GoFundMe URL, e.g. 'help-james-taylor-fight-cancer'."""
+    match = re.search(r'gofundme\.com/f/([^/?#\s]+)', fundraiser_link or '')
+    return match.group(1) if match else None
+
+def build_queries(pitch):
     """
-    Search by fundraiser name — this is the story title the journalist
-    would reference, not the pitcher's name (which is a GFM comms employee).
-    e.g. "Zachary Rupert Ince" or "Elderly Couple ruined by Cowboy Builders"
-    Strip common GoFundMe boilerplate phrases that add noise.
+    Returns a list of (label, query) pairs to try in order.
+    Slug-based search is tried first — if an article mentions the GoFundMe URL
+    it's definitively about this fundraiser. Name search is the fallback.
     """
+    queries = []
+    slug = extract_slug(pitch['fundraiser_link'])
+    if slug:
+        queries.append(('slug', f'gofundme.com/f/{slug}'))
     name = pitch['fundraiser_name'].strip()
-    # Remove common GFM boilerplate from fundraiser names
     for phrase in ['GoFundMe', 'Help Us', 'Help Me', 'Support for', 'In Loving Memory',
                    'Fundraiser for', 'Raising money for']:
         name = re.sub(re.escape(phrase), '', name, flags=re.IGNORECASE).strip(' :-')
-    name = name.strip(' :-').strip()
-    if not name:
-        name = pitch['fundraiser_name']
-    # No quotes — broader match finds more coverage where articles paraphrase the title
-    return f'{name} GoFundMe'
+    name = name.strip(' :-').strip() or pitch['fundraiser_name']
+    queries.append(('name', f'"{name}" GoFundMe'))
+    return queries
 
 STOPWORDS = {
     'the','a','an','and','or','for','to','in','of','on','at','is','are','was',
@@ -158,11 +164,21 @@ STOPWORDS = {
     'after','with','from','into','during','through','about','by','as','up',
 }
 
+GENERIC_CAPS = {
+    'Help', 'Fund', 'Support', 'Fight', 'Save', 'Give', 'Memory', 'Memorial',
+    'Medical', 'Cancer', 'Family', 'Journey', 'Battle', 'Appeal', 'Raise',
+    'After', 'During', 'Against', 'With', 'From', 'Their', 'This', 'That',
+}
+
 def headline_confidence(fundraiser_name, headline):
     """
-    Returns 'High' if enough significant words from the fundraiser name
-    appear in the article headline, 'Low' otherwise.
-    Low-confidence matches are likely false positives (wrong story matched).
+    Returns 'High' only when the headline is a strong match for this specific fundraiser.
+    Rules:
+      1. At least 2 significant words must match.
+      2. Overall word-overlap score must be >= 0.70.
+      3. If the fundraiser name contains a person name (2+ consecutive capitalised
+         words that aren't generic nouns), at least one consecutive pair must appear
+         as a phrase in the headline — prevents "James" matching "James Van Der Beek".
     """
     words = [
         w.lower() for w in re.findall(r'\w+', fundraiser_name)
@@ -172,14 +188,55 @@ def headline_confidence(fundraiser_name, headline):
         return 'Low'
     headline_lower = headline.lower()
     matches = sum(1 for w in words if w in headline_lower)
-    score = matches / len(words)
-    return 'High' if score >= 0.5 else 'Low'
+
+    if matches < 2:
+        return 'Low'
+    if matches / len(words) < 0.70:
+        return 'Low'
+
+    # Person-name phrase check — extract consecutive capitalised name words
+    cap_words = [w for w in re.findall(r'\b[A-Z][a-z]{2,}\b', fundraiser_name)
+                 if w not in GENERIC_CAPS]
+    if len(cap_words) >= 2:
+        pairs = [f'{cap_words[i].lower()} {cap_words[i+1].lower()}'
+                 for i in range(len(cap_words) - 1)]
+        if not any(p in headline_lower for p in pairs):
+            return 'Low'
+
+    return 'High'
 
 def is_likely_uk(article):
     source_name = (article.get('source') or {}).get('name', '') or ''
     url = article.get('url', '') or ''
     text = source_name + ' ' + url
     return any(sig.lower() in text.lower() for sig in UK_SIGNALS)
+
+def parse_rss_date(date_str):
+    """Parse RSS/RFC 2822 or ISO date string to datetime, or None on failure."""
+    if not date_str:
+        return None
+    try:
+        t = parsedate(date_str)
+        if t:
+            return datetime(*t[:6])
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(date_str[:10], '%Y-%m-%d')
+    except Exception:
+        return None
+
+def article_in_date_window(article, pitch_month):
+    """Return True if article date falls within 30 days before to 90 days after pitch month start."""
+    pub = parse_rss_date(article.get('publishedAt', ''))
+    if not pub:
+        return True  # can't determine date — include it
+    try:
+        pm_start = datetime.strptime(pitch_month + '-01', '%Y-%m-%d')
+        delta = (pub - pm_start).days
+        return -30 <= delta <= 90
+    except Exception:
+        return True
 
 USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -241,6 +298,24 @@ def search_google_news(query):
 # EMAIL
 # ─────────────────────────────────────────────
 
+def _article_card(a):
+    pub_raw     = a.get('publishedAt') or ''
+    pub_date    = parse_rss_date(pub_raw)
+    pub_str     = pub_date.strftime('%-d %b %Y') if pub_date else pub_raw[:10]
+    source_name = (a.get('source') or {}).get('name', 'Unknown')
+    title       = a.get('title', '(no title)')
+    url         = a.get('url', '#')
+    desc        = ((a.get('description') or '')[:130] + '…') if a.get('description') else ''
+    uk_badge    = '🇬🇧 ' if is_likely_uk(a) else ''
+    return f"""
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+    <div style="font-size:10px;color:#00B964;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px">
+      {uk_badge}{source_name} &nbsp;·&nbsp; {pub_str}
+    </div>
+    <a href="{url}" style="color:#111;font-weight:600;font-size:12px;text-decoration:none;line-height:1.4">{title}</a>
+    <p style="font-size:11px;color:#6B7280;margin:4px 0 0;line-height:1.5">{desc}</p>
+  </div>"""
+
 def format_email(results, month, validate_mode=False):
     found     = [r for r in results if r['articles']]
     not_found = [r for r in results if not r['articles']]
@@ -265,49 +340,51 @@ def format_email(results, month, validate_mode=False):
 </div>
 """
 
-    # ── FOUND ──
-    if found:
-        html += f'<h2 style="font-size:15px;margin-bottom:14px">✅ Potential placements — please confirm in CMS ({len(found)})</h2>'
-        for r in found:
-            html += f"""
-<div style="border:1.5px solid #D1FAE5;border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#F0FBF6">
-  <div style="font-weight:700;font-size:14px">{r['name']}</div>
-  <div style="font-size:11px;color:#6B7280;margin-bottom:10px">
-    {r['fundraiser_name'][:70]}
+    # ── GROUP BY PITCHER ──
+    pitchers = {}
+    for r in results:
+        pitchers.setdefault(r['name'], []).append(r)
+
+    for pitcher_name in sorted(pitchers.keys()):
+        pitcher_results = pitchers[pitcher_name]
+        p_found     = [r for r in pitcher_results if r['articles']]
+        p_not_found = [r for r in pitcher_results if not r['articles']]
+
+        html += f"""
+<div style="margin-bottom:32px;border:1px solid #E5E7EB;border-radius:10px;overflow:hidden">
+  <div style="background:#F9FAFB;padding:10px 16px;border-bottom:1px solid #E5E7EB;display:flex;justify-content:space-between;align-items:center">
+    <span style="font-weight:700;font-size:14px">{pitcher_name}</span>
+    <span style="font-size:12px;color:#6B7280">{len(p_found)} found &nbsp;·&nbsp; {len(p_not_found)} not found</span>
+  </div>"""
+
+        if p_found:
+            html += f'<div style="padding:14px 16px">'
+            html += f'<div style="font-size:11px;font-weight:600;color:#00B964;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">✅ Potential placements — please confirm in CMS</div>'
+            for r in p_found:
+                html += f"""
+<div style="border:1.5px solid #D1FAE5;border-radius:8px;padding:12px 14px;margin-bottom:10px;background:#F0FBF6">
+  <div style="font-size:11px;color:#6B7280;margin-bottom:8px">
+    <strong style="color:#111">{r['fundraiser_name'][:70]}</strong>
     &nbsp;·&nbsp;<a href="{r['fundraiser_link']}" style="color:#00B964">{r['fundraiser_link'][:50]}</a>
   </div>"""
-            for a in r['articles']:
-                pub_date    = (a.get('publishedAt') or '')[:10]
-                source_name = (a.get('source') or {}).get('name', 'Unknown')
-                title       = a.get('title', '(no title)')
-                url         = a.get('url', '#')
-                desc        = ((a.get('description') or '')[:130] + '…') if a.get('description') else ''
-                uk_badge    = '🇬🇧 ' if is_likely_uk(a) else ''
-                html += f"""
-  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:6px;padding:10px 12px;margin-bottom:6px">
-    <div style="font-size:10px;color:#00B964;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px">
-      {uk_badge}{source_name} &nbsp;·&nbsp; {pub_date}
-    </div>
-    <a href="{url}" style="color:#111;font-weight:600;font-size:12px;text-decoration:none;line-height:1.4">{title}</a>
-    <p style="font-size:11px;color:#6B7280;margin:4px 0 0;line-height:1.5">{desc}</p>
-  </div>"""
+                for a in r['articles']:
+                    html += _article_card(a)
+                html += '</div>'
             html += '</div>'
 
-    # ── NOT FOUND ──
-    if not_found:
-        html += f'<h2 style="font-size:15px;margin:22px 0 10px">⭕ No coverage found ({len(not_found)})</h2>'
-        html += '<div style="background:#F9FAFB;border:1px solid #E5E7EB;border-radius:10px;overflow:hidden">'
-        for r in not_found:
-            html += f"""
-<div style="padding:8px 14px;border-bottom:1px solid #F3F4F6;font-size:12px">
-  <span style="font-weight:600">{r['name']}</span>
-  <span style="color:#9CA3AF;float:right">{r['fundraiser_name'][:50]}</span>
-</div>"""
+        if p_not_found:
+            html += f'<div style="padding:10px 16px;border-top:1px solid #F3F4F6">'
+            html += f'<div style="font-size:11px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">⭕ No coverage found</div>'
+            html += '<div style="display:flex;flex-wrap:wrap;gap:6px">'
+            for r in p_not_found:
+                html += f'<span style="font-size:11px;background:#F3F4F6;border-radius:4px;padding:3px 8px;color:#374151">{r["fundraiser_name"][:45]}</span>'
+            html += '</div></div>'
+
         html += '</div>'
 
     html += f"""
 <p style="font-size:11px;color:#9CA3AF;margin-top:22px;padding-top:12px;border-top:1px solid #E5E7EB;line-height:1.6">
-  Searched via NewsAPI · UK sources prioritised · {len(results)} fundraisers checked<br>
+  Searched via Google News · UK sources prioritised · {len(results)} fundraisers checked<br>
   Found a missed placement? Reply to this email with the URL and we'll add it.
 </p>
 </body></html>"""
@@ -336,7 +413,8 @@ def main():
     parser.add_argument('--recipients', nargs='+', default=['drickman@gofundme.com'], help='Email recipients')
     parser.add_argument('--preview',    action='store_true', help='Save HTML preview only — no email sent')
     parser.add_argument('--validate',   action='store_true', help='Test against already-placed fundraisers to measure accuracy')
-    parser.add_argument('--no-cache',   action='store_true', help='Ignore cache and re-search everything')
+    parser.add_argument('--no-cache',      action='store_true', help='Ignore cache and re-search everything')
+    parser.add_argument('--refresh-empty', action='store_true', help='Re-search pitches previously cached with no coverage found')
     parser.add_argument('--rate',       type=int, default=40, help='Requests per hour (default 40, increase with caution)')
     parser.add_argument('--pitcher',    nargs='+', default=None, help='Filter by pitcher name(s), e.g. --pitcher "asa bennett" adela')
     args = parser.parse_args()
@@ -380,21 +458,29 @@ def main():
         cache_key = pitch['id'] or pitch['name']
 
         if cache_key in cache:
-            print(f"[{i+1}/{len(targets)}] Cache hit: {pitch['name']}")
-            results.append({**pitch, 'articles': cache[cache_key]})
-            continue
+            cached = cache[cache_key]
+            if cached or not args.refresh_empty:
+                print(f"[{i+1}/{len(targets)}] Cache hit: {pitch['name']}")
+                results.append({**pitch, 'articles': cached})
+                continue
+            # refresh_empty=True and cache was empty — fall through to re-search
 
-        query = build_query(pitch)
-
-        print(f"[{i+1}/{len(targets)}] Searching: {query}")
-        articles = search_google_news(query)
-
-        # Filter to high-confidence matches only — removes false positives like
-        # generic GoFundMe articles that don't mention the actual fundraiser
-        articles = [
-            a for a in articles
-            if headline_confidence(pitch['fundraiser_name'], a.get('title', '')) == 'High'
-        ]
+        articles = []
+        for label, query in build_queries(pitch):
+            print(f"[{i+1}/{len(targets)}] Searching ({label}): {query}")
+            raw = search_google_news(query)
+            if label == 'slug':
+                # Slug match is definitive — no confidence filter needed, just date
+                filtered = [a for a in raw if article_in_date_window(a, args.month)]
+            else:
+                filtered = [
+                    a for a in raw
+                    if headline_confidence(pitch['fundraiser_name'], a.get('title', '')) == 'High'
+                    and article_in_date_window(a, args.month)
+                ]
+            articles.extend(filtered)
+            if articles:
+                break  # Found via higher-confidence query — no need for fallback
 
         results.append({**pitch, 'articles': articles, 'skipped': False})
         cache[cache_key] = articles
